@@ -1,0 +1,11 @@
+# Node dependencies
+/orca-logseq-importer/node_modules/
+/orca-logseq-importer/dist/
+
+# Template and example folders
+/orca-plugin-template-main/
+/orca-simple-task-main/
+
+# IDE and OS files
+.vscode/
+.DS_Store

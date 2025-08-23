@@ -1,0 +1,9 @@
+{
+  "name": "Logseq Importer",
+  "version": "0.1.0",
+  "description": "一个帮助您从 Logseq 导入笔记到虎鲸笔记的插件。",
+  "main": "dist/index.js",
+  "author": "AI Code Engineer",
+  "homepage": "",
+  "icon": ""
+}
