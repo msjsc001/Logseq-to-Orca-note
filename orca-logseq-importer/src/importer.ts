@@ -1,111 +1,150 @@
-import type { Block, DbId } from "./orca.d";
+import type { Block } from "./orca.d";
 import type { LogseqBlock, LogseqGraph, LogseqPage } from "./parser";
 
-export type UuidToDbIdMap = Map<string, number>;
+type ContentFragment = {
+  t: string;
+  v: any;
+  f?: string;
+  [key: string]: any;
+};
 
+type Repr = {
+  type: string;
+  level?: number;
+  content: ContentFragment[];
+  indent?: number;
+  properties?: { name: string; value: any; type: number }[];
+  [key: string]: any;
+};
+
+/**
+ * Parses a single line of Logseq content into an array of Orca ContentFragments.
+ * @param content The string content of a single Logseq block.
+ * @param graph The entire Logseq graph, used to resolve block references.
+ * @returns An array of ContentFragment objects.
+ */
+function parseContentToFragments(content: string, graph: LogseqGraph): ContentFragment[] {
+  const fragments: ContentFragment[] = [];
+  const regex = /(!\[[^\]]*\]\([^)]+\))|(\[\[[^\]]+\]\])|(#\S+)|(\(\(([^)]+)\)\))|\{\{embed \(\(([^)]+)\)\)\}\}/g;
+  
+  let lastIndex = 0;
+  let match;
+
+  while ((match = regex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      fragments.push({ t: "t", v: content.substring(lastIndex, match.index) });
+    }
+
+    const [fullMatch, asset, link, tag, refUuid, embedUuid] = match;
+
+    if (asset) {
+      // Keep asset syntax as is, for potential future handling by Orca.
+      fragments.push({ t: "t", v: asset });
+    } else if (link) {
+      const pageName = link.substring(2, link.length - 2);
+      fragments.push({ t: "r", v: pageName });
+    } else if (tag) {
+      const tagName = tag.substring(1).replace(/\[\[/g, "").replace(/\]\]/g, ""); // Clean up tags like #[[tag]]
+      fragments.push({ t: "r", v: tagName });
+    } else if (refUuid) {
+        const foundBlock = graph.blocks.get(refUuid);
+        const refText = foundBlock ? `"${foundBlock.content.substring(0, 50)}..."` : refUuid;
+        fragments.push({ t: "t", v: `[块引用: ${refText}]` });
+    } else if (embedUuid) {
+        const foundBlock = graph.blocks.get(embedUuid);
+        const embedText = foundBlock ? `"${foundBlock.content.substring(0, 50)}..."` : embedUuid;
+        fragments.push({ t: "t", v: `[块嵌入: ${embedText}]` });
+    }
+    
+    lastIndex = regex.lastIndex;
+  }
+
+  if (lastIndex < content.length) {
+    fragments.push({ t: "t", v: content.substring(lastIndex) });
+  }
+
+  return fragments;
+}
+
+
+/**
+ * Converts Logseq blocks to Orca Repr objects recursively.
+ * @param logseqBlocks The blocks to convert.
+ * @param graph The full Logseq graph for context.
+ * @param currentIndent The current indentation level.
+ * @returns A flat array of Repr objects.
+ */
+function convertLogseqBlocksToReprs(logseqBlocks: LogseqBlock[], graph: LogseqGraph, currentIndent = 0): Repr[] {
+  const reprs: Repr[] = [];
+  for (const block of logseqBlocks) {
+    const contentFragments = parseContentToFragments(block.content, graph);
+
+    const repr: Repr = {
+      type: "text",
+      content: contentFragments,
+      indent: currentIndent,
+    };
+    
+    if (Object.keys(block.properties).length > 0) {
+       repr.properties = Object.entries(block.properties).map(([name, value]) => ({ name, value: String(value), type: 1 }));
+    }
+
+    reprs.push(repr);
+
+    if (block.children.length > 0) {
+      reprs.push(...convertLogseqBlocksToReprs(block.children, graph, currentIndent + 1));
+    }
+  }
+  return reprs;
+}
+
+/**
+ * Imports a batch of Logseq pages into Orca Note.
+ * @param pagesToImport An array of LogseqPage objects to import.
+ * @param graph The entire Logseq graph.
+ */
 export async function importPageBatch(
   pagesToImport: LogseqPage[],
-  graph: LogseqGraph,
-  uuidToDbIdMap: UuidToDbIdMap
+  graph: LogseqGraph
 ) {
-  const currentBatchDbIds = new Set<DbId>();
-
-  // --- PASS 1: Create all blocks and properties for this batch ---
   await orca.commands.invokeGroup(
     async () => {
       for (const page of pagesToImport) {
-        const pageBlockId = await orca.commands.invokeEditorCommand(
-          "core.editor.insertBlock",
-          null, null, null,
-          [{ t: "t", v: page.name }],
-          { type: "heading", level: 1 }
-        );
-        currentBatchDbIds.add(pageBlockId);
-        await createBlocksRecursively(page.blocks, pageBlockId, uuidToDbIdMap, currentBatchDbIds);
-      }
-    },
-    { undoable: true, topGroup: true }
-  );
-
-  // --- PASS 2: Link all references for newly created blocks ---
-  console.log(`[Importer] Starting Pass 2 for a batch of ${currentBatchDbIds.size} blocks.`);
-  const blocksToUpdate = (await orca.invokeBackend("get-blocks", Array.from(currentBatchDbIds))) as Block[];
-  console.log(`[Importer] Fetched ${blocksToUpdate?.length ?? 0} blocks from backend for Pass 2.`);
-
-  if (!blocksToUpdate || !Array.isArray(blocksToUpdate)) {
-    console.error("[Importer] ERROR: `get-blocks` did not return an iterable array.", blocksToUpdate);
-    orca.notify("error", "无法从后端获取已创建的块，链接步骤中止。");
-    return;
-  }
-
-  await orca.commands.invokeGroup(
-    async () => {
-      for (const block of blocksToUpdate) {
-        if (!block || !block.content) continue;
+        await new Promise(resolve => setTimeout(resolve, 50)); 
         
-        const originalContent = block.text ?? "";
-        let newContent = originalContent;
+        try {
+          const pageProperties = page.properties.alias
+            ? Object.entries(page.properties).map(([key, value]) => ({ name: key, value: Array.isArray(value) ? value.join(", ") : String(value), type: 1 }))
+            : [];
+          
+          const pageBlockId = await orca.commands.invokeEditorCommand(
+            "core.editor.insertBlock",
+            null, null, null,
+            [{ t: "t", v: page.name }],
+            { type: "heading", level: 1, properties: pageProperties }
+          );
 
-        const LINK_REGEX = /\[\[([^\]]+)\]\]/g;
-        const TAG_REGEX = /#([^\s#\[\]\(\)]+)/g;
-        const BLOCK_REF_REGEX = /\(\(([^\)]+)\)\)/g;
-        const BLOCK_EMBED_REGEX = /\{\{embed \(\(([^\)]+)\)\}\}/g;
-        const ASSET_REGEX = /!\[([^\]]*)\]\(\.\.\/(assets\/[^\)]+)\)/g;
+          if (!pageBlockId) throw new Error(`Failed to create page block for "${page.name}"`);
 
-        newContent = newContent.replace(ASSET_REGEX, "![$1](assets/$2)");
-        newContent = newContent.replace(LINK_REGEX, (match, pageName) => `#[[((${pageName}))]]`);
-        newContent = newContent.replace(TAG_REGEX, (match, tagName) => `#[[((${tagName}))]]`);
-        newContent = newContent.replace(BLOCK_REF_REGEX, (match, blockUuid) => {
-          const referencedDbId = uuidToDbIdMap.get(blockUuid);
-          return referencedDbId ? `((${referencedDbId}))` : match;
-        });
-        newContent = newContent.replace(BLOCK_EMBED_REGEX, (match, blockUuid) => {
-          const referencedDbId = uuidToDbIdMap.get(blockUuid);
-          return referencedDbId ? `{{embed ((${referencedDbId}))}}` : match;
-        });
-
-        if (newContent !== originalContent) {
-          console.log(`[Importer] Updating block ${block.id} with new content.`);
-          await orca.commands.invokeEditorCommand("core.editor.updateBlock", null, block.id, [{ t: "t", v: newContent }]);
+          const pageBlock = await orca.invokeBackend("get-block", pageBlockId);
+          if (!pageBlock) throw new Error(`Could not retrieve created page block for "${page.name}"`);
+          
+          if (page.blocks.length > 0) {
+            const blockReprs = convertLogseqBlocksToReprs(page.blocks, graph);
+            if (blockReprs.length > 0) {
+              await orca.commands.invokeEditorCommand(
+                "core.editor.batchInsertReprs",
+                null, pageBlock, "lastChild", blockReprs
+              );
+            }
+          }
+          console.log(`[Importer] Successfully imported page: ${page.name}`);
+        } catch (e: any) {
+          console.error(`[Importer] Failed to import page "${page.name}":`, e);
+          orca.notify("error", `导入页面 "${page.name}" 失败: ${e.message}`);
         }
       }
     },
     { undoable: true, topGroup: true }
   );
-  console.log("[Importer] Finished Pass 2 for the batch.");
-}
-
-async function createBlocksRecursively(
-  logseqBlocks: LogseqBlock[],
-  parentDbId: number,
-  uuidToDbIdMap: UuidToDbIdMap,
-  batchDbIdSet: Set<DbId>
-) {
-  for (const block of logseqBlocks) {
-    const parentBlock = orca.state.blocks[parentDbId];
-    if (!parentBlock) {
-      console.error(`[Importer] Could not find parent block with ID: ${parentDbId}`);
-      continue;
-    }
-    const blockId = await orca.commands.invokeEditorCommand(
-      "core.editor.insertBlock",
-      null, parentBlock, "lastChild",
-      [{ t: "t", v: block.content }],
-      { type: "text" }
-    );
-    batchDbIdSet.add(blockId);
-
-    if (block.id) {
-      uuidToDbIdMap.set(block.id, blockId);
-    }
-
-    if (Object.keys(block.properties).length > 0) {
-      const propertiesToSet = Object.entries(block.properties).map(([name, value]) => ({ name, value }));
-      await orca.commands.invokeEditorCommand("core.editor.setProperties", null, [blockId], propertiesToSet);
-    }
-
-    if (block.children.length > 0) {
-      await createBlocksRecursively(block.children, blockId, uuidToDbIdMap, batchDbIdSet);
-    }
-  }
 }

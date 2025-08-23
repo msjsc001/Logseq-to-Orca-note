@@ -22,11 +22,14 @@ async function startImportProcess(files: LogseqFile[]) {
         orca.notify("info", `解析完成: ${allPages.length} 个页面。开始分批导入...`);
 
         const BATCH_SIZE = 50;
-        const uuidToDbIdMap = new Map<string, number>();
         for (let i = 0; i < allPages.length; i += BATCH_SIZE) {
             const batch = allPages.slice(i, i + BATCH_SIZE);
-            await importPageBatch(batch, graph, uuidToDbIdMap);
-            orca.notify("info", `导入进度: ${Math.min(i + BATCH_SIZE, allPages.length)} / ${allPages.length}`);
+            const currentBatch = i / BATCH_SIZE + 1;
+            const totalBatches = Math.ceil(allPages.length / BATCH_SIZE);
+            
+            orca.notify("info", `开始处理第 ${currentBatch} / ${totalBatches} 批次...`);
+            await importPageBatch(batch, graph);
+            orca.notify("info", `第 ${currentBatch} / ${totalBatches} 批次完成。总进度: ${Math.min(i + BATCH_SIZE, allPages.length)} / ${allPages.length}`);
         }
 
         orca.notify("success", "所有批次导入完成！");
