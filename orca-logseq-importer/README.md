@@ -19,6 +19,7 @@
 
 （下图左侧为Logseq原始笔记，右侧为本插件导入虎-鲸后的不佳效果）
 [图片对比]
+<img width="3379" height="1438" alt="PixPin_2025-08-23_23-33-25" src="https://github.com/user-attachments/assets/423b5f11-a6a4-4441-9a7c-2f3bee4e4357" />
 
 *这是一个占位符，实际使用时应替换为效果对比图*
 
