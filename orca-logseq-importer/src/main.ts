@@ -7,7 +7,7 @@ import type { LogseqFile } from "./parser";
 
 let pluginName: string;
 
-async function startImportProcess(files: LogseqFile[]) {
+async function startImportProcess(logseqFolder: FileSystemDirectoryHandle, files: LogseqFile[]) {
     try {
         const mdFiles = files.filter(f => f.path.endsWith('.md'));
         if (mdFiles.length === 0) {
@@ -28,7 +28,7 @@ async function startImportProcess(files: LogseqFile[]) {
             const totalBatches = Math.ceil(allPages.length / BATCH_SIZE);
             
             orca.notify("info", `开始处理第 ${currentBatch} / ${totalBatches} 批次...`);
-            await importPageBatch(batch, graph);
+            await importPageBatch(batch, graph, logseqFolder);
             orca.notify("info", `第 ${currentBatch} / ${totalBatches} 批次完成。总进度: ${Math.min(i + BATCH_SIZE, allPages.length)} / ${allPages.length}`);
         }
 
@@ -63,7 +63,7 @@ function openImporterUI() {
     
     // @ts-ignore
     const ui = window.React.createElement(ImporterUI, {
-        onFilesSelected: startImportProcess,
+        onConfirm: startImportProcess,
         onClose: handleClose,
     });
     root.render(ui);

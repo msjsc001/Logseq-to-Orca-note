@@ -1,98 +1,218 @@
-import type { Block } from "./orca.d";
+import type { Block, ContentFragment, Repr } from "./orca.d";
 import type { LogseqBlock, LogseqGraph, LogseqPage } from "./parser";
 
-type ContentFragment = {
-  t: string;
-  v: any;
-  f?: string;
-  [key: string]: any;
-};
-
-type Repr = {
-  type: string;
-  level?: number;
-  content: ContentFragment[];
-  indent?: number;
-  properties?: { name: string; value: any; type: number }[];
-  [key: string]: any;
-};
+// More specific regex to avoid capturing unintended parts.
+const ATTACHMENT_REGEX = /(!?\[(.*?)\]\((.*?)\))\s*(\{:(.*?)\})?/;
 
 /**
- * Parses a single line of Logseq content into an array of Orca ContentFragments.
- * @param content The string content of a single Logseq block.
- * @param graph The entire Logseq graph, used to resolve block references.
- * @returns An array of ContentFragment objects.
+ * Pre-scans all pages to find local asset paths and uploads them to Orca.
+ * Creates a mapping from old local paths to new Orca paths.
  */
-function parseContentToFragments(content: string, graph: LogseqGraph): ContentFragment[] {
-  const fragments: ContentFragment[] = [];
-  const regex = /(!\[[^\]]*\]\([^)]+\))|(\[\[[^\]]+\]\])|(#\S+)|(\(\(([^)]+)\)\))|\{\{embed \(\(([^)]+)\)\)\}\}/g;
-  
-  let lastIndex = 0;
-  let match;
+async function preUploadAssetsAndGetPathMap(
+  pagesToImport: LogseqPage[],
+  logseqFolder: FileSystemDirectoryHandle,
+): Promise<Map<string, string>> {
+  const assetPathMap = new Map<string, string>();
+  const allAssetPaths = new Set<string>();
 
-  while ((match = regex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      fragments.push({ t: "t", v: content.substring(lastIndex, match.index) });
+  const collectPaths = (blocks: LogseqBlock[]) => {
+    for(const block of blocks) {
+        for (const match of block.content.matchAll(new RegExp(ATTACHMENT_REGEX, 'g'))) {
+            const localPath = match[3];
+            if (localPath.startsWith('../assets/')) {
+                allAssetPaths.add(localPath);
+            }
+        }
+        if(block.children.length > 0) {
+            collectPaths(block.children);
+        }
     }
+  }
 
-    const [fullMatch, asset, link, tag, refUuid, embedUuid] = match;
+  for (const page of pagesToImport) {
+    collectPaths(page.blocks);
+  }
 
-    if (asset) {
-      // Keep asset syntax as is, for potential future handling by Orca.
-      fragments.push({ t: "t", v: asset });
-    } else if (link) {
-      const pageName = link.substring(2, link.length - 2);
-      fragments.push({ t: "r", v: pageName });
-    } else if (tag) {
-      const tagName = tag.substring(1).replace(/\[\[/g, "").replace(/\]\]/g, ""); // Clean up tags like #[[tag]]
-      fragments.push({ t: "r", v: tagName });
-    } else if (refUuid) {
-        const foundBlock = graph.blocks.get(refUuid);
-        const refText = foundBlock ? `"${foundBlock.content.substring(0, 50)}..."` : refUuid;
-        fragments.push({ t: "t", v: `[块引用: ${refText}]` });
-    } else if (embedUuid) {
-        const foundBlock = graph.blocks.get(embedUuid);
-        const embedText = foundBlock ? `"${foundBlock.content.substring(0, 50)}..."` : embedUuid;
-        fragments.push({ t: "t", v: `[块嵌入: ${embedText}]` });
-    }
+  if (allAssetPaths.size === 0) return assetPathMap;
+
+  try {
+    const assetsFolder = await logseqFolder.getDirectoryHandle('assets');
+    const filesToUpload: File[] = [];
+    const pathsToUpload: string[] = [];
     
-    lastIndex = regex.lastIndex;
+    for (const originalPath of allAssetPaths) {
+        const relativePath = originalPath.substring(10); // remove '../assets/'
+        try {
+            const fileHandle = await assetsFolder.getFileHandle(relativePath, { create: false });
+            const file = await fileHandle.getFile();
+            filesToUpload.push(file);
+            pathsToUpload.push(originalPath);
+        } catch (e) {
+            console.warn(`[Assets] Asset file not found and skipped: ${relativePath}`, e);
+        }
+    }
+
+    if (filesToUpload.length > 0) {
+        orca.notify("info", `准备上传 ${filesToUpload.length} 个附件...`);
+        const result = await orca.invokeBackend("upload-assets", filesToUpload);
+
+        if (result && result.uploaded) {
+            for (let i = 0; i < result.uploaded.length; i++) {
+                assetPathMap.set(pathsToUpload[i], result.uploaded[i].path);
+            }
+        }
+        if (result && result.failed && result.failed.length > 0) {
+             orca.notify("warn", `${result.failed.length} 个附件上传失败。`);
+             console.warn("[Assets] Failed to upload:", result.failed);
+        }
+    }
+  } catch (e) {
+      console.error("[Assets] Could not open 'assets' directory.", e);
+      orca.notify("error", "无法打开 'assets' 文件夹，附件迁移失败。");
   }
 
-  if (lastIndex < content.length) {
-    fragments.push({ t: "t", v: content.substring(lastIndex) });
+  return assetPathMap;
+}
+
+/**
+ * Parses a content string into an array of Orca ContentFragments.
+ * This is the core transformation function.
+ */
+function parseContentToFragments(
+  content: string,
+  graph: LogseqGraph,
+  assetPathMap: Map<string, string>
+): ContentFragment[] {
+  const fragments: ContentFragment[] = [];
+  let buffer = "";
+  let i = 0;
+
+  const flushBuffer = () => {
+    if (buffer) {
+      fragments.push({ t: "t", v: buffer });
+      buffer = "";
+    }
+  };
+
+  while (i < content.length) {
+    const remaining = content.substring(i);
+
+    // 1. Block Embed: {{embed ((uuid))}}
+    if (remaining.startsWith("{{embed ((")) {
+      const endIdx = remaining.indexOf("))}}");
+      if (endIdx !== -1) {
+        flushBuffer();
+        const uuid = remaining.substring(10, endIdx);
+        const block = graph.blocks.get(uuid);
+        fragments.push({ t: "r", v: block?.content || `未找到的块: ${uuid}`, q: uuid });
+        i += endIdx + 4;
+        continue;
+      }
+    }
+
+    // 2. Block Reference: ((uuid))
+    if (remaining.startsWith("((")) {
+      const endIdx = remaining.indexOf("))");
+      if (endIdx !== -1) {
+        flushBuffer();
+        const uuid = remaining.substring(2, endIdx);
+        const block = graph.blocks.get(uuid);
+        fragments.push({ t: "r", v: block?.content || `未找到的块: ${uuid}`, q: uuid });
+        i += endIdx + 2;
+        continue;
+      }
+    }
+
+    // 3. Page Link or Tag: [[...]] or #[[...]]
+    if (remaining.startsWith("[[") || remaining.startsWith("#[[")) {
+      const isTag = remaining.startsWith("#");
+      const startIdx = isTag ? 3 : 2;
+      const endIdx = remaining.indexOf("]]");
+      if (endIdx !== -1) {
+        flushBuffer();
+        const pageName = remaining.substring(startIdx, endIdx);
+        fragments.push({ t: "r", v: pageName });
+        i += endIdx + 2;
+        continue;
+      }
+    }
+
+    // 4. Simple Tag: #tag
+    const tagMatch = remaining.match(/^#([^\s#\[\]]+)/);
+    if (tagMatch) {
+      flushBuffer();
+      fragments.push({ t: "r", v: tagMatch[1] });
+      i += tagMatch[0].length;
+      continue;
+    }
+
+    // 5. Attachments
+    const attachmentMatch = remaining.match(ATTACHMENT_REGEX);
+    if (attachmentMatch) {
+      flushBuffer();
+      const [fullMatch, , altText, localPath, , attrs] = attachmentMatch;
+      const newPath = assetPathMap.get(localPath);
+
+      if (newPath) {
+        const isImage = /\.(png|jpg|jpeg|gif|svg|webp)$/i.test(localPath);
+        if (isImage) {
+          const imageFragment: ContentFragment = { t: "i", v: newPath, a: altText };
+          if(attrs) {
+            const width = attrs.match(/:width\s+(\d+)/)?.[1];
+            const height = attrs.match(/:height\s+(\d+)/)?.[1];
+            if(width) imageFragment.w = parseInt(width);
+            if(height) imageFragment.h = parseInt(height);
+          }
+          fragments.push(imageFragment);
+        } else {
+          fragments.push({ t: "t", v: altText || localPath.split('/').pop()!, f: "l", fa: { l: newPath, t: "_blank" } });
+        }
+      } else {
+        fragments.push({ t: "t", v: `[附件未找到: ${localPath}]` });
+      }
+      i += fullMatch.length;
+      continue;
+    }
+
+    buffer += content[i];
+    i++;
   }
 
+  flushBuffer();
   return fragments;
 }
 
-
 /**
- * Converts Logseq blocks to Orca Repr objects recursively.
- * @param logseqBlocks The blocks to convert.
- * @param graph The full Logseq graph for context.
- * @param currentIndent The current indentation level.
- * @returns A flat array of Repr objects.
+ * Converts Logseq blocks to Orca Repr objects recursively, preserving hierarchy.
  */
-function convertLogseqBlocksToReprs(logseqBlocks: LogseqBlock[], graph: LogseqGraph, currentIndent = 0): Repr[] {
+function convertLogseqBlocksToReprs(
+  logseqBlocks: LogseqBlock[],
+  graph: LogseqGraph,
+  assetPathMap: Map<string, string>,
+  currentIndent = 0
+): Repr[] {
   const reprs: Repr[] = [];
   for (const block of logseqBlocks) {
-    const contentFragments = parseContentToFragments(block.content, graph);
+    const contentFragments = parseContentToFragments(block.content, graph, assetPathMap);
 
     const repr: Repr = {
       type: "text",
-      content: contentFragments,
+      content: contentFragments.length > 0 ? contentFragments : [{ t: 't', v: '' }],
       indent: currentIndent,
     };
     
     if (Object.keys(block.properties).length > 0) {
-       repr.properties = Object.entries(block.properties).map(([name, value]) => ({ name, value: String(value), type: 1 }));
+       repr.properties = Object.entries(block.properties).map(([name, value]) => ({ 
+           name, 
+           value: String(value), 
+           type: 1 // PropType.Text
+        }));
     }
 
     reprs.push(repr);
 
     if (block.children.length > 0) {
-      reprs.push(...convertLogseqBlocksToReprs(block.children, graph, currentIndent + 1));
+      reprs.push(...convertLogseqBlocksToReprs(block.children, graph, assetPathMap, currentIndent + 1));
     }
   }
   return reprs;
@@ -100,47 +220,54 @@ function convertLogseqBlocksToReprs(logseqBlocks: LogseqBlock[], graph: LogseqGr
 
 /**
  * Imports a batch of Logseq pages into Orca Note.
- * @param pagesToImport An array of LogseqPage objects to import.
- * @param graph The entire Logseq graph.
  */
 export async function importPageBatch(
   pagesToImport: LogseqPage[],
-  graph: LogseqGraph
+  graph: LogseqGraph,
+  logseqFolder: FileSystemDirectoryHandle,
 ) {
+  orca.notify("info", "开始分析和上传附件...");
+  const assetPathMap = await preUploadAssetsAndGetPathMap(pagesToImport, logseqFolder);
+  orca.notify("success", "附件处理完成。");
+
   await orca.commands.invokeGroup(
     async () => {
       for (const page of pagesToImport) {
-        await new Promise(resolve => setTimeout(resolve, 50)); 
-        
+        await new Promise((resolve) => setTimeout(resolve, 10)); // Shorter delay
         try {
-          const pageProperties = page.properties.alias
-            ? Object.entries(page.properties).map(([key, value]) => ({ name: key, value: Array.isArray(value) ? value.join(", ") : String(value), type: 1 }))
-            : [];
+          const pageProperties = Object.entries(page.properties).map(
+            ([key, value]) => ({
+              name: key,
+              value: Array.isArray(value) ? value.join(", ") : String(value),
+              type: 1, // PropType.Text
+            })
+          );
           
           const pageBlockId = await orca.commands.invokeEditorCommand(
-            "core.editor.insertBlock",
-            null, null, null,
+            "core.editor.insertBlock", null, null, null,
             [{ t: "t", v: page.name }],
-            { type: "heading", level: 1, properties: pageProperties }
+            { type: "heading", level: 1 }
           );
 
-          if (!pageBlockId) throw new Error(`Failed to create page block for "${page.name}"`);
+          if (!pageBlockId) throw new Error(`创建页面失败: "${page.name}"`);
+          
+          if(pageProperties.length > 0) {
+              await orca.commands.invokeEditorCommand("core.editor.setProperties", null, [pageBlockId], pageProperties);
+          }
 
           const pageBlock = await orca.invokeBackend("get-block", pageBlockId);
-          if (!pageBlock) throw new Error(`Could not retrieve created page block for "${page.name}"`);
-          
+          if (!pageBlock) throw new Error(`获取页面块失败: "${page.name}"`);
+
           if (page.blocks.length > 0) {
-            const blockReprs = convertLogseqBlocksToReprs(page.blocks, graph);
+            const blockReprs = convertLogseqBlocksToReprs(page.blocks, graph, assetPathMap);
             if (blockReprs.length > 0) {
               await orca.commands.invokeEditorCommand(
-                "core.editor.batchInsertReprs",
-                null, pageBlock, "lastChild", blockReprs
+                "core.editor.batchInsertReprs", null, pageBlock, "lastChild", blockReprs
               );
             }
           }
-          console.log(`[Importer] Successfully imported page: ${page.name}`);
         } catch (e: any) {
-          console.error(`[Importer] Failed to import page "${page.name}":`, e);
+          console.error(`[Importer] 导入页面 "${page.name}" 失败:`, e);
           orca.notify("error", `导入页面 "${page.name}" 失败: ${e.message}`);
         }
       }
